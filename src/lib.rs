@@ -34,6 +34,8 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let mut lambda_fields = vec![];
+    let mut field_keys = vec![];
+    let mut get_field_value = vec![];
     let fields = match &struct_item.fields {
         Fields::Named(fields_named) => fields_named
             .named
@@ -45,11 +47,42 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
     for field in fields {
         let field_name = field.to_string();
         let field_lit = Literal::string(&field_name);
+        let field_ident = Ident::new(&format!("{field_name}"), Span::call_site());
         let func_ident = Ident::new(&format!("{field_name}_field"), Span::call_site());
         lambda_fields.push(quote! {
-            pub fn #func_ident() -> batis4sqlx::LambdaField<'b> {batis4sqlx::LambdaField::new(#field_lit)}
+            pub fn #func_ident() -> batis4sqlx::LambdaField<'b> {
+                batis4sqlx::LambdaField::new(#field_lit)
+            }
         });
+        field_keys.push(quote! {
+            field_keys.push(Self::#func_ident());
+        });
+        get_field_value.push(quote! {
+            k if k == *Self::#func_ident() => {
+                if let Some(value) = self.#field_ident {
+                    value.into()
+                } else {
+                    batis4sqlx::wrapper::SqlValue::Null
+                }
+            },
+        })
     }
+    lambda_fields.push(quote! {
+        pub fn field_keys() -> Vec<batis4sqlx::LambdaField<'b>> {
+            let mut field_keys = vec![];
+            #(#field_keys)*
+            field_keys
+        }
+
+        pub fn get_field_value(&self, key: batis4sqlx::LambdaField<'b>) -> SqlValue {
+            match *key {
+                #(#get_field_value)*
+                &_ => {
+                    panic!("unknown field")
+                }
+            }
+        }
+    });
 
     let expanded = quote! {
         #item
@@ -69,7 +102,51 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
     .into();
-    println!("{}", expanded);
+    expanded
+}
+
+#[proc_macro_attribute]
+pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
+    let repository_attr = syn::parse_macro_input!(attr as RepositoryAttr);
+    let item = parse_macro_input!(input as Item);
+
+    let struct_item = match &item {
+        Item::Struct(s) => s,
+        _ => {
+            return syn::Error::new(item.span(), "#[repository] only use struct")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    let struct_name = &struct_item.ident;
+
+    let impls;
+    match repository_attr.db_type.to_lowercase().as_str() {
+        "mysql" => {
+            impls = quote! {
+                async fn save(&self, vo: &mut #struct_name) -> Result<u64> {
+                    let mut insert_sql = format!("INSERT INTO {} ", E::table_name());
+                    for field in E::field_keys() {
+                        insert_sql += *field;
+                    }
+                    /// 拼接其他sql，等待完善
+                }
+            }
+        }
+        _ => {
+            return syn::Error::new(item.span(), "unknow db type.")
+                .to_compile_error()
+                .into();
+        }
+    }
+
+    let expanded = quote! {
+        #item
+        #impls
+    }
+    .into();
+    println!("{expanded}");
     expanded
 }
 
@@ -114,6 +191,31 @@ impl Parse for EntityAttr {
                                 None
                             })
                             .collect();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(attr)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RepositoryAttr {
+    db_type: String,
+}
+
+impl Parse for RepositoryAttr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut attr = RepositoryAttr::default();
+        let args: Punctuated<syn::MetaNameValue, Token![,]> = Punctuated::parse_terminated(input)?;
+        for meta in args {
+            match meta.path.get_ident().unwrap().to_string().as_str() {
+                "db_type" => {
+                    if let Expr::Lit(expr_lit) = &meta.value {
+                        if let syn::Lit::Str(lit_str) = &expr_lit.lit {
+                            attr.db_type = lit_str.value();
+                        }
                     }
                 }
                 _ => {}
