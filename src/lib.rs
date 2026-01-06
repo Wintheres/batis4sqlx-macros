@@ -21,17 +21,17 @@ impl Parse for EntityAttr {
         for meta in args {
             match meta.path.get_ident().unwrap().to_string().as_str() {
                 "table_name" => {
-                    if let Expr::Lit(expr_lit) = &meta.value {
-                        if let syn::Lit::Str(lit_str) = &expr_lit.lit {
-                            attr.table_name = Some(lit_str.value());
-                        }
+                    if let Expr::Lit(expr_lit) = &meta.value
+                        && let syn::Lit::Str(lit_str) = &expr_lit.lit
+                    {
+                        attr.table_name = Some(lit_str.value());
                     }
                 }
                 "primary_key" => {
-                    if let Expr::Lit(expr_lit) = &meta.value {
-                        if let syn::Lit::Str(lit_str) = &expr_lit.lit {
-                            attr.primary_key = Some(lit_str.value());
-                        }
+                    if let Expr::Lit(expr_lit) = &meta.value
+                        && let syn::Lit::Str(lit_str) = &expr_lit.lit
+                    {
+                        attr.primary_key = Some(lit_str.value());
                     }
                 }
                 "ignore_field" => {
@@ -40,10 +40,10 @@ impl Parse for EntityAttr {
                             .elems
                             .iter()
                             .filter_map(|elem| {
-                                if let Expr::Lit(expr_lit) = elem {
-                                    if let syn::Lit::Str(lit_str) = &expr_lit.lit {
-                                        return Some(lit_str.value());
-                                    }
+                                if let Expr::Lit(expr_lit) = elem
+                                    && let syn::Lit::Str(lit_str) = &expr_lit.lit
+                                {
+                                    return Some(lit_str.value());
                                 }
                                 None
                             })
@@ -119,7 +119,7 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
             continue 'outside;
         }
         let field_lit = Literal::string(&field_name);
-        let field_ident = Ident::new(&format!("{field_name}"), Span::call_site());
+        let field_ident = Ident::new(&field_name, Span::call_site());
         let func_ident = Ident::new(&format!("{field_name}_field"), Span::call_site());
         lambda_fields.push(quote! {
             pub fn #func_ident() -> batis4sqlx::LambdaField<'b> {
@@ -156,7 +156,7 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     });
 
-    let expanded = quote! {
+    quote! {
         #item
 
         impl batis4sqlx::Entity for #struct_name {
@@ -173,8 +173,7 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
             #(#lambda_fields)*
         }
     }
-    .into();
-    expanded
+    .into()
 }
 
 #[derive(Debug, Default)]
@@ -190,17 +189,17 @@ impl Parse for RepositoryAttr {
         for meta in args {
             match meta.path.get_ident().unwrap().to_string().as_str() {
                 "db_type" => {
-                    if let Expr::Lit(expr_lit) = &meta.value {
-                        if let syn::Lit::Str(lit_str) = &expr_lit.lit {
-                            attr.db_type = lit_str.value();
-                        }
+                    if let Expr::Lit(expr_lit) = &meta.value
+                        && let syn::Lit::Str(lit_str) = &expr_lit.lit
+                    {
+                        attr.db_type = lit_str.value();
                     }
                 }
                 "entity_path" => {
-                    if let Expr::Lit(expr_lit) = &meta.value {
-                        if let syn::Lit::Str(lit_str) = &expr_lit.lit {
-                            attr.entity_path = lit_str.value();
-                        }
+                    if let Expr::Lit(expr_lit) = &meta.value
+                        && let syn::Lit::Str(lit_str) = &expr_lit.lit
+                    {
+                        attr.entity_path = lit_str.value();
                     }
                 }
                 _ => {}
@@ -225,13 +224,11 @@ pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let struct_name = &struct_item.ident;
-
-    let impls;
     let entity_path = repository_attr.entity_path.as_str();
-    let entity_path_ident = Ident::new(&format!("{entity_path}"), Span::call_site());
-    match repository_attr.db_type.to_lowercase().as_str() {
+    let entity_path_ident = Ident::new(entity_path, Span::call_site());
+    let impls = match repository_attr.db_type.to_lowercase().as_str() {
         "mysql" => {
-            impls = quote! {
+            quote! {
                 pub async fn save(&self, vo: &#entity_path_ident) -> batis4sqlx::Result<u64> {
                     let mut insert_sql = format!("INSERT INTO {} (", <#entity_path_ident as batis4sqlx::Entity>::table_name());
                     let mut fields = vec![];
@@ -331,7 +328,7 @@ pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
                 .to_compile_error()
                 .into();
         }
-    }
+    };
 
     let expanded = quote! {
         #item
