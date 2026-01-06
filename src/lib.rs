@@ -338,7 +338,6 @@ pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
     .into();
-    println!("{}", expanded);
     expanded
 }
 
