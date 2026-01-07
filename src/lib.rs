@@ -5,13 +5,25 @@ use std::collections::HashSet;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::{Expr, Fields, Item, Token, parse_macro_input};
+use syn::{Expr, Fields, GenericArgument, Item, PathArguments, Token, Type, parse_macro_input};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EntityAttr {
     table_name: Option<String>,
     primary_key: Option<String>,
     ignore_field: HashSet<String>,
+    last_insert_id: bool,
+}
+
+impl Default for EntityAttr {
+    fn default() -> Self {
+        Self {
+            table_name: None,
+            primary_key: None,
+            ignore_field: HashSet::new(),
+            last_insert_id: true,
+        }
+    }
 }
 
 impl Parse for EntityAttr {
@@ -50,6 +62,13 @@ impl Parse for EntityAttr {
                             .collect();
                     }
                 }
+                "last_insert_id" => {
+                    if let Expr::Lit(expr_lit) = &meta.value {
+                        if let syn::Lit::Bool(lit_bool) = &expr_lit.lit {
+                            attr.last_insert_id = lit_bool.value;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -86,6 +105,7 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut lambda_fields = vec![];
     let mut field_keys = vec![];
     let mut get_field_value = vec![];
+    let mut last_insert_id = vec![];
     let field_atts = match &struct_item.fields {
         Fields::Named(fields_named) => fields_named
             .named
@@ -94,9 +114,20 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
                 // 字段名称
                 let field_name = f.ident.clone().unwrap();
                 // 字段类型
-                let _field_type = &f.ty;
+                let field_type = &f.ty;
                 // 字段上的宏
                 let atts = &f.attrs;
+                if entity_attr.last_insert_id
+                    && field_name.to_string().eq(primary_key)
+                    && let Some(result) = parse_u64_or_option_u64(field_type)
+                {
+                    let primary_key_ident = Ident::new(&primary_key, Span::call_site());
+                    if result {
+                        last_insert_id.push(quote! { self.#primary_key_ident = Some(id) });
+                    } else {
+                        last_insert_id.push(quote! { self.#primary_key_ident = id });
+                    }
+                }
                 (field_name, atts)
             })
             .collect(),
@@ -156,7 +187,7 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     });
 
-    quote! {
+    let result = quote! {
         #item
 
         impl batis4sqlx::Entity for #struct_name {
@@ -172,8 +203,15 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
         impl<'b> #struct_name {
             #(#lambda_fields)*
         }
+
+        impl #struct_name {
+            pub fn last_insert_id(&mut self, id: u64) {
+                #(#last_insert_id)*
+            }
+        }
     }
-    .into()
+    .into();
+    result
 }
 
 #[derive(Debug, Default)]
@@ -229,7 +267,7 @@ pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
     let impls = match repository_attr.db_type.to_lowercase().as_str() {
         "mysql" => {
             quote! {
-                pub async fn save(&self, vo: &#entity_path_ident) -> batis4sqlx::Result<u64> {
+                pub async fn save(&self, vo: &mut #entity_path_ident) -> batis4sqlx::Result<u64> {
                     let mut insert_sql = format!("INSERT INTO {} (", <#entity_path_ident as batis4sqlx::Entity>::table_name());
                     let mut fields = vec![];
                     let mut values = vec![];
@@ -265,6 +303,7 @@ pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
                     let result = batis4sqlx::repository::bind_query(insert, &values)
                         .execute(self.borrow_db())
                         .await?;
+                    vo.last_insert_id(result.last_insert_id());
                     Ok(result.rows_affected())
                 }
 
@@ -362,4 +401,33 @@ fn pascal_to_snake(name: &str) -> String {
     }
 
     result
+}
+
+fn parse_u64_or_option_u64(ty: &Type) -> Option<bool> {
+    if is_u64(ty) {
+        return Some(false);
+    }
+
+    if let Type::Path(tp) = ty
+        && tp.qself.is_none()
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Option"
+        && let PathArguments::AngleBracketed(args) = &seg.arguments
+        && args.args.len() == 1
+        && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+        && is_u64(inner_ty)
+    {
+        return Some(true);
+    }
+
+    None
+}
+
+fn is_u64(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Path(tp)
+            if tp.qself.is_none()
+            && tp.path.is_ident("u64")
+    )
 }
