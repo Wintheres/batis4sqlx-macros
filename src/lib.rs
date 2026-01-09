@@ -1,33 +1,27 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Literal, Span};
 use quote::quote;
-use std::collections::HashSet;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::{Expr, Fields, GenericArgument, Item, PathArguments, Token, Type, parse_macro_input};
+use syn::{
+    Attribute, Expr, Fields, GenericArgument, Item, LitStr, PathArguments, Result, Token, Type,
+    parse_macro_input,
+};
 
 #[derive(Debug)]
 struct EntityAttr {
     table_name: Option<String>,
-    primary_key: Option<String>,
-    ignore_field: HashSet<String>,
-    last_insert_id: bool,
 }
 
 impl Default for EntityAttr {
     fn default() -> Self {
-        Self {
-            table_name: None,
-            primary_key: None,
-            ignore_field: HashSet::new(),
-            last_insert_id: true,
-        }
+        Self { table_name: None }
     }
 }
 
 impl Parse for EntityAttr {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
+    fn parse(input: ParseStream) -> Result<Self> {
         let mut attr = EntityAttr::default();
         let args: Punctuated<syn::MetaNameValue, Token![,]> = Punctuated::parse_terminated(input)?;
         for meta in args {
@@ -37,36 +31,6 @@ impl Parse for EntityAttr {
                         && let syn::Lit::Str(lit_str) = &expr_lit.lit
                     {
                         attr.table_name = Some(lit_str.value());
-                    }
-                }
-                "primary_key" => {
-                    if let Expr::Lit(expr_lit) = &meta.value
-                        && let syn::Lit::Str(lit_str) = &expr_lit.lit
-                    {
-                        attr.primary_key = Some(lit_str.value());
-                    }
-                }
-                "ignore_field" => {
-                    if let Expr::Array(expr_array) = &meta.value {
-                        attr.ignore_field = expr_array
-                            .elems
-                            .iter()
-                            .filter_map(|elem| {
-                                if let Expr::Lit(expr_lit) = elem
-                                    && let syn::Lit::Str(lit_str) = &expr_lit.lit
-                                {
-                                    return Some(lit_str.value());
-                                }
-                                None
-                            })
-                            .collect();
-                    }
-                }
-                "last_insert_id" => {
-                    if let Expr::Lit(expr_lit) = &meta.value {
-                        if let syn::Lit::Bool(lit_bool) = &expr_lit.lit {
-                            attr.last_insert_id = lit_bool.value;
-                        }
                     }
                 }
                 _ => {}
@@ -96,16 +60,108 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
     } else {
         &pascal_to_snake(&struct_name.to_string())
     };
-    let primary_key = if let Some(primary_key) = &entity_attr.primary_key {
-        primary_key.as_str()
-    } else {
-        "id"
+
+    let mut field_name = "id".to_string();
+    match &struct_item.fields {
+        Fields::Named(fields_named) => {
+            for field in &fields_named.named {
+                let attrs = &field.attrs;
+                for attr in attrs {
+                    if let Some(entity_field_attr) = EntityFieldAttr::from_attrs(attr).unwrap() {
+                        if entity_field_attr.primary_key {
+                            field_name = if let Some(name) = entity_field_attr.name {
+                                name
+                            } else {
+                                field.ident.clone().unwrap().to_string()
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     };
 
-    let mut lambda_fields = vec![];
-    let mut field_keys = vec![];
-    let mut get_field_value = vec![];
-    let mut last_insert_id = vec![];
+    let field_name_lit = Literal::string(field_name.as_str());
+
+    let result = quote! {
+        #item
+
+        impl batis4sqlx::Entity for #struct_name {
+            fn table_name() -> &'static str {
+                #table_name
+            }
+            fn primary_key<'b>() -> batis4sqlx::LambdaField<'b> {
+                batis4sqlx::LambdaField::new(#field_name_lit)
+            }
+        }
+    }
+    .into();
+    result
+}
+
+#[derive(Debug, Default)]
+struct EntityFieldAttr {
+    pub primary_key: bool,
+    pub skip: bool,
+    pub name: Option<String>,
+}
+
+impl EntityFieldAttr {
+    pub fn from_attrs(attr: &Attribute) -> Result<Option<Self>> {
+        if attr.path().is_ident("entity_field") {
+            return Ok(Some(attr.parse_args_with(EntityFieldAttr::parse)?));
+        }
+        Ok(None)
+    }
+}
+
+impl Parse for EntityFieldAttr {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let mut result = EntityFieldAttr::default();
+
+        while !input.is_empty() {
+            let ident: Ident = input.parse()?;
+
+            if ident == "primary_key" {
+                result.primary_key = true;
+            } else if ident == "skip" {
+                result.skip = true;
+            } else if ident == "name" {
+                input.parse::<Token![=]>()?;
+                let lit: LitStr = input.parse()?;
+                result.name = Some(lit.value());
+            } else {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    format!("未知的 entity_field 属性: {}", ident),
+                ));
+            }
+
+            // 处理逗号
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+#[proc_macro_derive(Entity, attributes(entity_field))]
+pub fn entity_field(input: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(input as Item);
+
+    let struct_item = match &item {
+        Item::Struct(s) => s,
+        _ => {
+            return syn::Error::new(item.span(), "#[derive[Entity]] only use struct")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    let struct_name = &struct_item.ident;
     let field_atts = match &struct_item.fields {
         Fields::Named(fields_named) => fields_named
             .named
@@ -117,44 +173,42 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
                 let field_type = &f.ty;
                 // 字段上的宏
                 let atts = &f.attrs;
-                if entity_attr.last_insert_id
-                    && field_name.to_string().eq(primary_key)
-                    && let Some(result) = parse_u64_or_option_u64(field_type)
-                {
-                    let primary_key_ident = Ident::new(&primary_key, Span::call_site());
-                    if result {
-                        last_insert_id.push(quote! { self.#primary_key_ident = Some(id) });
-                    } else {
-                        last_insert_id.push(quote! { self.#primary_key_ident = id });
-                    }
-                }
-                (field_name, atts)
+                (field_name, field_type, atts)
             })
             .collect(),
         _ => vec![],
     };
-    'outside: for (field, atts) in field_atts {
+    let mut field_keys = vec![];
+    let mut get_field_value = vec![];
+    let mut lambda_fields = vec![];
+    let mut set_primary_key = vec![];
+    'outside: for (field, field_type, attrs) in field_atts {
         let field_name = field.to_string();
-        let mut has_sqlx_skip = false;
-        for att in atts {
-            if att.path().is_ident("sqlx") {
-                let _ = att.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("skip") {
-                        has_sqlx_skip = true;
-                    }
-                    Ok(())
-                });
-            }
-        }
-        if has_sqlx_skip || entity_attr.ignore_field.contains(&field_name) {
-            continue 'outside;
-        }
-        let field_lit = Literal::string(&field_name);
         let field_ident = Ident::new(&field_name, Span::call_site());
         let func_ident = Ident::new(&format!("{field_name}_field"), Span::call_site());
+        let mut field_name_alis_lit = Literal::string(field.to_string().as_str());
+        for attr in attrs {
+            if let Some(entity_field_attr) = EntityFieldAttr::from_attrs(attr).unwrap() {
+                if entity_field_attr.skip {
+                    continue 'outside;
+                }
+                if let Some(name) = entity_field_attr.name {
+                    field_name_alis_lit = Literal::string(&name);
+                }
+                if entity_field_attr.primary_key {
+                    if let Some(result) = parse_u64_or_option_u64(field_type) {
+                        if result {
+                            set_primary_key.push(quote! { self.#field_ident = Some(id) });
+                        } else {
+                            set_primary_key.push(quote! { self.#field_ident = id });
+                        }
+                    }
+                }
+            }
+        }
         lambda_fields.push(quote! {
             pub fn #func_ident() -> batis4sqlx::LambdaField<'b> {
-                batis4sqlx::LambdaField::new(#field_lit)
+                batis4sqlx::LambdaField::new(#field_name_alis_lit)
             }
         });
         field_keys.push(quote! {
@@ -186,27 +240,14 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
             }
         }
     });
-
     let result = quote! {
-        #item
-
-        impl batis4sqlx::Entity for #struct_name {
-            fn table_name() -> &'static str {
-                #table_name
-            }
-
-            fn primary_key() -> &'static str {
-                #primary_key
-            }
-        }
-
         impl<'b> #struct_name {
             #(#lambda_fields)*
         }
 
         impl #struct_name {
-            pub fn last_insert_id(&mut self, id: u64) {
-                #(#last_insert_id)*
+            pub fn set_primary_key(&mut self, id: u64) {
+                #(#set_primary_key)*
             }
         }
     }
@@ -221,7 +262,7 @@ struct RepositoryAttr {
 }
 
 impl Parse for RepositoryAttr {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
+    fn parse(input: ParseStream) -> Result<Self> {
         let mut attr = RepositoryAttr::default();
         let args: Punctuated<syn::MetaNameValue, Token![,]> = Punctuated::parse_terminated(input)?;
         for meta in args {
@@ -303,8 +344,86 @@ pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
                     let result = batis4sqlx::repository::bind_query(insert, &values)
                         .execute(self.borrow_db())
                         .await?;
-                    vo.last_insert_id(result.last_insert_id());
+                    vo.set_primary_key(result.last_insert_id());
                     Ok(result.rows_affected())
+                }
+
+                pub async fn save_batch(&self, vec: &Vec<#entity_path_ident>, batch_size: Option<u64>) -> batis4sqlx::Result<u64> {
+                    let vec_len = vec.len();
+                    let batch_size = if let Some(batch_size) = batch_size {
+                        batch_size
+                    } else {
+                        if vec_len > 1000 { 1000 } else { vec_len as u64 }
+                    };
+                    let mut insert_sql_prefix = format!(
+                        "INSERT INTO {} (",
+                        <#entity_path_ident as batis4sqlx::Entity>::table_name()
+                    );
+                    let lambda_fields = #entity_path_ident::field_keys();
+                    let mut values = vec![];
+                    for vo in vec {
+                        let mut sql_values = vec![];
+                        for field in &lambda_fields {
+                            let sql_value = vo.get_field_value(field);
+                            match sql_value {
+                                batis4sqlx::wrapper::SqlValue::Null => {
+                                    sql_values.push(batis4sqlx::wrapper::SqlValue::Null);
+                                }
+                                _ => {
+                                    sql_values.push(sql_value);
+                                }
+                            }
+                        }
+                        values.push(sql_values);
+                    }
+                    let fields = lambda_fields
+                        .iter()
+                        .map(|field| (**field).to_string())
+                        .collect::<Vec<String>>()
+                        .join(",");
+                    insert_sql_prefix.push_str(&fields);
+                    insert_sql_prefix.push_str(") VALUES ");
+                    let mut index = 0;
+                    let mut rows = 0;
+                    loop {
+                        let mut insert_sql = insert_sql_prefix.clone();
+                        let mut sql_values_bind = vec![];
+                        for i in index..vec_len {
+                            let sql_values = &values[i];
+                            insert_sql.push_str("(");
+                            let sql_values = sql_values
+                                .iter()
+                                .map(|sql_value| {
+                                    sql_values_bind.push(sql_value.clone());
+                                    "?".to_string()
+                                })
+                                .collect::<Vec<String>>()
+                                .join(",");
+                            insert_sql.push_str(&sql_values);
+                            insert_sql.push_str("),");
+                            index += 1;
+                            if batch_size % index as u64 == 0 {
+                                break;
+                            }
+                        }
+                        if sql_values_bind.is_empty() {
+                            break;
+                        }
+                        insert_sql.pop();
+                        let insert = sqlx::query(&insert_sql);
+                        let result = batis4sqlx::repository::bind_query(insert, &sql_values_bind)
+                            .execute(self.borrow_db())
+                            .await;
+                        if let Ok(result) = result {
+                            rows += result.rows_affected();
+                        } else {
+                            return Err(result.err().unwrap());
+                        }
+                        if index >= vec_len {
+                            break;
+                        }
+                    }
+                    Ok(rows)
                 }
 
                 pub async fn update_by_primary_key(&self, vo: &#entity_path_ident) -> batis4sqlx::Result<u64> {
@@ -330,7 +449,7 @@ pub fn repository(attr: TokenStream, input: TokenStream) -> TokenStream {
                         .join(", ");
                     update_sql.push_str(&fields);
                     let primary_key = <#entity_path_ident as batis4sqlx::Entity>::primary_key();
-                    let primary_key_lambda = batis4sqlx::LambdaField::new(primary_key);
+                    let primary_key_lambda = batis4sqlx::LambdaField::new(*primary_key);
                     values.push(vo.get_field_value(&primary_key_lambda));
                     update_sql.push_str(&format!(" WHERE {} = ? LIMIT 1", primary_key));
                     let update = sqlx::query(&update_sql);
