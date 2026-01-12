@@ -5,8 +5,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Expr, Fields, GenericArgument, Item, LitStr, PathArguments, Result, Token, Type,
-    parse_macro_input,
+    Attribute, Expr, Field, Fields, GenericArgument, Item, LitStr, PathArguments, Result, Token,
+    Type, parse_macro_input,
 };
 
 #[derive(Debug)]
@@ -45,7 +45,7 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
     let entity_attr = syn::parse_macro_input!(attr as EntityAttr);
     let item = parse_macro_input!(input as Item);
 
-    let struct_item = match &item {
+    let mut struct_item = match item.clone() {
         Item::Struct(s) => s,
         _ => {
             return syn::Error::new(item.span(), "#[entity] only use struct")
@@ -62,21 +62,25 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let mut field_name = "id".to_string();
-    match &struct_item.fields {
+    match &mut struct_item.fields {
         Fields::Named(fields_named) => {
-            for field in &fields_named.named {
+            for field in &mut fields_named.named {
                 let attrs = &field.attrs;
+                let mut entity_field_attr_opt = None;
                 for attr in attrs {
-                    if let Some(entity_field_attr) = EntityFieldAttr::from_attrs(attr).unwrap() {
+                    entity_field_attr_opt = EntityFieldAttr::from_attrs(attr).unwrap();
+                    if let Some(ref entity_field_attr) = entity_field_attr_opt {
                         if entity_field_attr.primary_key {
-                            field_name = if let Some(name) = entity_field_attr.name {
+                            field_name = if let Some(name) = entity_field_attr.name.clone() {
                                 name
                             } else {
                                 field.ident.clone().unwrap().to_string()
                             };
                         }
                     }
+                    break;
                 }
+                add_sqlx_attr(field, entity_field_attr_opt);
             }
         }
         _ => {}
@@ -85,7 +89,7 @@ pub fn entity(attr: TokenStream, input: TokenStream) -> TokenStream {
     let field_name_lit = Literal::string(field_name.as_str());
 
     let result = quote! {
-        #item
+        #struct_item
 
         impl batis4sqlx::Entity for #struct_name {
             fn table_name() -> &'static str {
@@ -549,4 +553,94 @@ fn is_u64(ty: &Type) -> bool {
             if tp.qself.is_none()
             && tp.path.is_ident("u64")
     )
+}
+
+#[derive(Debug, Default)]
+struct SqlxAttr {
+    default: bool,
+    skip: bool,
+    rename: Option<String>,
+}
+
+impl SqlxAttr {
+    pub fn from_attrs(attr: &Attribute) -> Result<Option<Self>> {
+        if attr.path().is_ident("sqlx") {
+            return Ok(Some(attr.parse_args_with(SqlxAttr::parse)?));
+        }
+        Ok(None)
+    }
+}
+
+impl Parse for SqlxAttr {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let mut result = SqlxAttr::default();
+
+        while !input.is_empty() {
+            let ident: Ident = input.parse()?;
+
+            if ident == "default" {
+                result.default = true;
+            } else if ident == "skip" {
+                result.skip = true;
+            } else if ident == "rename" {
+                input.parse::<Token![=]>()?;
+                let lit: LitStr = input.parse()?;
+                result.rename = Some(lit.value());
+            } else {
+            }
+
+            // 处理逗号
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+fn add_sqlx_attr(field: &mut Field, entity_field_attr_opt: Option<EntityFieldAttr>) {
+    let mut sqlx_skip = false;
+    let mut sqlx_default = false;
+    let mut sqlx_rename = None;
+    for attr in &field.attrs {
+        if let Some(sqlx_attr) = SqlxAttr::from_attrs(attr).unwrap() {
+            sqlx_skip = sqlx_attr.skip;
+            sqlx_default = sqlx_attr.default;
+            sqlx_rename = sqlx_attr.rename;
+        }
+    }
+    let mut meta_tokens = vec![];
+    if let Some(entity_field_attr) = entity_field_attr_opt {
+        if entity_field_attr.skip {
+            if sqlx_skip {
+                return;
+            } else {
+                meta_tokens.push(quote!(skip));
+            }
+        } else {
+            if !sqlx_default {
+                meta_tokens.push(quote!(default));
+            }
+            if sqlx_rename.is_none()
+                && let Some(ref name) = entity_field_attr.name
+            {
+                meta_tokens.push(quote!(rename = #name));
+            }
+        }
+    } else {
+        if !sqlx_skip && !sqlx_default {
+            meta_tokens.push(quote!(default));
+        }
+    }
+
+    if meta_tokens.is_empty() {
+        return;
+    }
+
+    let sqlx_attr = syn::parse_quote! {
+        #[sqlx( #(#meta_tokens),* )]
+    };
+
+    field.attrs.insert(0, sqlx_attr);
 }
